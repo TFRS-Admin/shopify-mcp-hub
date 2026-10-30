@@ -10,6 +10,8 @@
 // Optional: SHOPIFY_API_VERSION (default 2026-10)
 import express from "express";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
@@ -50,24 +52,52 @@ function opType(doc) {
 }
 const hasMutation = (doc) => /(^|[\s}])mutation\b/.test(doc.replace(/#[^\n]*/g, ""));
 
-async function getToken(store) {
-  if (store.token) return store.token;
-  if (store.cache && Date.now() < store.cache.expiresAt - 60_000) return store.cache.token;
-  const r = await fetch(`https://${store.domain}/admin/oauth/access_token`, {
+const DATA_DIR = process.env.DATA_DIR || "/data";
+const TOKEN_FILE = path.join(DATA_DIR, "tokens.json");
+function readTokens() { try { return JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8")); } catch { return {}; } }
+function writeToken(key, rec) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const all = readTokens(); all[key] = rec;
+  fs.writeFileSync(TOKEN_FILE, JSON.stringify(all), { mode: 0o600 });
+}
+const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
+const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
+
+async function tokenRequest(domain, params) {
+  const r = await fetch(`https://${domain}/admin/oauth/access_token`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ grant_type: "client_credentials", client_id: store.clientId, client_secret: store.clientSecret }),
+    body: new URLSearchParams(params),
   });
   const text = await r.text();
   if (!r.ok) throw new Error(`token request failed (${r.status}): ${text.slice(0, 300)}`);
-  const j = JSON.parse(text);
+  return JSON.parse(text);
+}
+
+// Order: static STORE_<K>_TOKEN -> token saved by the install flow (/auth/start) -> client credentials grant.
+async function getToken(store, key) {
+  if (store.token) return store.token;
+  const saved = readTokens()[key];
+  if (saved) {
+    if (!saved.expires_at || Date.now() < saved.expires_at - 60_000) return saved.access_token;
+    if (saved.refresh_token) {
+      const j = await tokenRequest(store.domain, { grant_type: "refresh_token", refresh_token: saved.refresh_token,
+        client_id: store.clientId || CLIENT_ID, client_secret: store.clientSecret || CLIENT_SECRET });
+      const rec = { access_token: j.access_token, refresh_token: j.refresh_token || saved.refresh_token,
+        expires_at: j.expires_in ? Date.now() + j.expires_in * 1000 : null };
+      writeToken(key, rec); return rec.access_token;
+    }
+  }
+  if (store.cache && Date.now() < store.cache.expiresAt - 60_000) return store.cache.token;
+  if (!(store.clientId && store.clientSecret)) throw new Error(`store not connected yet: open /auth/start?store=${key}&key=<store secret>`);
+  const j = await tokenRequest(store.domain, { grant_type: "client_credentials", client_id: store.clientId, client_secret: store.clientSecret });
   store.cache = { token: j.access_token, expiresAt: Date.now() + (j.expires_in || 86399) * 1000 };
   return store.cache.token;
 }
 
-async function shopifyGraphql(store, query, variables) {
+async function shopifyGraphql(store, key, query, variables) {
   let token;
-  try { token = await getToken(store); }
+  try { token = await getToken(store, key); }
   catch (e) { return { isError: true, content: [{ type: "text", text: String(e.message || e) }] }; }
   const r = await fetch(`https://${store.domain}/admin/api/${API_VERSION}/graphql.json`, {
     method: "POST",
@@ -83,14 +113,14 @@ function buildServer(key, store) {
   const server = new McpServer({ name: `shopify-${key}`, version: "1.0.0" });
   server.tool("get_shop_info",
     `Name, domain, plan and currency of the connected store (${key}). Call this first to confirm which store you are on.`,
-    {}, async () => shopifyGraphql(store, "{ shop { name myshopifyDomain primaryDomain { url } currencyCode plan { publicDisplayName } } }"));
+    {}, async () => shopifyGraphql(store, key, "{ shop { name myshopifyDomain primaryDomain { url } currencyCode plan { publicDisplayName } } }"));
   server.tool("graphql_query",
     `Run a read-only Admin GraphQL query on store '${key}' (${store.domain}). Mutations are rejected.`,
     { query: z.string().describe("GraphQL query"), variables: z.record(z.any()).optional() },
     async ({ query, variables }) => {
       if (opType(query) !== "query" || hasMutation(query))
         return { isError: true, content: [{ type: "text", text: "Only read-only queries are allowed on this tool." }] };
-      return shopifyGraphql(store, query, variables);
+      return shopifyGraphql(store, key, query, variables);
     });
   if (store.write) {
     server.tool("graphql_mutation",
@@ -99,7 +129,7 @@ function buildServer(key, store) {
       async ({ query, variables }) => {
         if (opType(query) !== "mutation")
           return { isError: true, content: [{ type: "text", text: "This tool only accepts a mutation." }] };
-        return shopifyGraphql(store, query, variables);
+        return shopifyGraphql(store, key, query, variables);
       });
   }
   return server;
@@ -126,6 +156,37 @@ app.post("/mcp/:store", async (req, res) => {
     console.error(e);
     if (!res.headersSent) res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal error" }, id: null });
   }
+});
+
+// ---- Install / authorize flow for stores outside your Shopify organization (e.g. a client's store) ----
+const pending = new Map(); // state -> { key, exp }
+app.get("/auth/start", (req, res) => {
+  const key = String(req.query.store || ""); const store = stores[key];
+  if (!store || !safeEq(String(req.query.key || ""), store.secret)) return res.status(401).send("Unauthorized");
+  const cid = store.clientId || CLIENT_ID;
+  if (!cid || !(store.clientSecret || CLIENT_SECRET) || !process.env.PUBLIC_URL) return res.status(500).send("Server needs SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET and PUBLIC_URL.");
+  const state = crypto.randomBytes(16).toString("hex");
+  pending.set(state, { key, exp: Date.now() + 10 * 60_000 });
+  const url = `https://${store.domain}/admin/oauth/authorize?` + new URLSearchParams({
+    client_id: cid, redirect_uri: `${process.env.PUBLIC_URL}/auth/callback`, state });
+  res.redirect(url);
+});
+app.get("/auth/callback", async (req, res) => {
+  try {
+    const { code, shop, state, hmac } = req.query;
+    const p = pending.get(String(state)); pending.delete(String(state));
+    if (!p || p.exp < Date.now()) return res.status(400).send("Link expired. Start again.");
+    const store = stores[p.key];
+    if (!store || String(shop) !== store.domain) return res.status(400).send("Store mismatch.");
+    const secret = store.clientSecret || CLIENT_SECRET;
+    const msg = Object.keys(req.query).filter((k) => k !== "hmac").sort().map((k) => `${k}=${req.query[k]}`).join("&");
+    const mac = crypto.createHmac("sha256", secret).update(msg).digest("hex");
+    if (!hmac || !safeEq(mac, String(hmac))) return res.status(400).send("Bad signature.");
+    const j = await tokenRequest(store.domain, { client_id: store.clientId || CLIENT_ID, client_secret: secret, code: String(code) });
+    writeToken(p.key, { access_token: j.access_token, refresh_token: j.refresh_token || null,
+      expires_at: j.expires_in ? Date.now() + j.expires_in * 1000 : null });
+    res.send(`<h2>Connected: ${p.key}</h2><p>Scopes granted: ${String(j.scope || "").replace(/[<>&]/g, "")}</p><p>You can close this tab.</p>`);
+  } catch (e) { console.error(e); res.status(500).send("Could not save the token: " + String(e.message).slice(0, 200)); }
 });
 const methodNotAllowed = (_req, res) => res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed" }, id: null });
 app.get("/mcp/:store", methodNotAllowed);
