@@ -5,8 +5,11 @@
 //   SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET   Dev Dashboard app credentials shared by all stores in your
 //                     organization (or STORE_<K>_CLIENT_ID / STORE_<K>_CLIENT_SECRET per store). The server
 //                     exchanges them for a 24-hour token and refreshes it automatically.
-//   STORE_<K>_SECRET  random string; the Claude connector sends it as "Authorization: Bearer <secret>"
-//   STORE_<K>_WRITE   "true" to enable the mutation tool (default: read-only)
+//   STORE_<K>_SECRET        READ key: random string; the Claude connector sends it as "Authorization: Bearer <secret>".
+//                           Can only run queries.
+//   STORE_<K>_WRITE_SECRET  WRITE key: a different random string. Same endpoint, but also exposes the
+//                           graphql_mutation tool. Use this one only in connectors that may change live data.
+//   STORE_<K>_WRITE         legacy: "true" makes STORE_<K>_SECRET a read+write key (ignored if WRITE_SECRET is set)
 // Optional: SHOPIFY_API_VERSION (default 2026-10)
 import express from "express";
 import crypto from "node:crypto";
@@ -29,13 +32,24 @@ function loadStores() {
     const clientId = process.env[`STORE_${k}_CLIENT_ID`] || process.env.SHOPIFY_CLIENT_ID;
     const clientSecret = process.env[`STORE_${k}_CLIENT_SECRET`] || process.env.SHOPIFY_CLIENT_SECRET;
     const secret = process.env[`STORE_${k}_SECRET`];
-    if (!secret || (!token && !(clientId && clientSecret))) { console.warn(`store ${key}: needs SECRET plus TOKEN or client id/secret, skipped`); continue; }
-    stores[key] = { domain: value.replace(/^https?:\/\//, "").replace(/\/$/, ""), token, clientId, clientSecret, secret, cache: null,
-      write: (process.env[`STORE_${k}_WRITE`] || "").toLowerCase() === "true" };
+    const writeSecret = process.env[`STORE_${k}_WRITE_SECRET`];
+    if ((!secret && !writeSecret) || (!token && !(clientId && clientSecret))) { console.warn(`store ${key}: needs SECRET and/or WRITE_SECRET plus TOKEN or client id/secret, skipped`); continue; }
+    if (secret && writeSecret && secret === writeSecret) { console.warn(`store ${key}: SECRET and WRITE_SECRET must differ, skipped`); continue; }
+    const legacyWrite = (process.env[`STORE_${k}_WRITE`] || "").toLowerCase() === "true";
+    stores[key] = { domain: value.replace(/^https?:\/\//, "").replace(/\/$/, ""), token, clientId, clientSecret, cache: null,
+      readSecret: secret, writeSecret: writeSecret || (legacyWrite ? secret : undefined) };
   }
   return stores;
 }
 const stores = loadStores();
+
+// Returns "write" | "read" | null for the presented key. Write is checked first so a legacy
+// single key that is both read and write resolves to write.
+function accessLevel(store, presented) {
+  if (store.writeSecret && safeEq(presented, store.writeSecret)) return "write";
+  if (store.readSecret && safeEq(presented, store.readSecret)) return "read";
+  return null;
+}
 
 const safeEq = (a, b) => {
   const x = crypto.createHash("sha256").update(a).digest();
@@ -50,6 +64,8 @@ function opType(doc) {
   const m = stripped.match(/^(query|mutation|subscription)\b/);
   return m ? m[1] : null;
 }
+// Mutation fields refused even with a write key (whole-word, case-sensitive match on the document).
+const BLOCKED_MUTATIONS = /\b(themePublish|themeDelete|appUninstall|appRevokeAccessScopes|refundCreate|orderCancel|orderCapture|giftCardCreate|giftCardUpdate|staffMemberDelete|shopLocaleDisable)\b/;
 const hasMutation = (doc) => /(^|[\s}])mutation\b/.test(doc.replace(/#[^\n]*/g, ""));
 
 const DATA_DIR = process.env.DATA_DIR || "/data";
@@ -109,7 +125,7 @@ async function shopifyGraphql(store, key, query, variables) {
   return { content: [{ type: "text", text }] };
 }
 
-function buildServer(key, store) {
+function buildServer(key, store, level) {
   const server = new McpServer({ name: `shopify-${key}`, version: "1.0.0" });
   server.tool("get_shop_info",
     `Name, domain, plan and currency of the connected store (${key}). Call this first to confirm which store you are on.`,
@@ -122,13 +138,16 @@ function buildServer(key, store) {
         return { isError: true, content: [{ type: "text", text: "Only read-only queries are allowed on this tool." }] };
       return shopifyGraphql(store, key, query, variables);
     });
-  if (store.write) {
+  if (level === "write") {
     server.tool("graphql_mutation",
-      `Run an Admin GraphQL MUTATION on store '${key}' (${store.domain}). This changes live data.`,
+      `Run an Admin GraphQL MUTATION on store '${key}' (${store.domain}). This changes LIVE data. Confirm the intended change with the user first, and always request userErrors { field message } in the selection.`,
       { query: z.string().describe("GraphQL mutation"), variables: z.record(z.any()).optional() },
       async ({ query, variables }) => {
         if (opType(query) !== "mutation")
           return { isError: true, content: [{ type: "text", text: "This tool only accepts a mutation." }] };
+        const blocked = query.match(BLOCKED_MUTATIONS);
+        if (blocked)
+          return { isError: true, content: [{ type: "text", text: `Blocked: '${blocked[1]}' is not allowed through this hub. Do this action in the Shopify admin instead.` }] };
         return shopifyGraphql(store, key, query, variables);
       });
   }
@@ -143,11 +162,13 @@ app.post("/mcp/:store", async (req, res) => {
   const key = req.params.store;
   const store = stores[key];
   const auth = req.get("authorization") || "";
-  if (!store || !auth.startsWith("Bearer ") || !safeEq(auth.slice(7), store.secret)) {
+  const presented = auth.startsWith("Bearer ") ? auth.slice(7) : (typeof req.query.key === "string" ? req.query.key : "");
+  const level = store && presented ? accessLevel(store, presented) : null;
+  if (!level) {
     return res.status(401).json({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
   }
   try {
-    const server = buildServer(key, store);
+    const server = buildServer(key, store, level);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => { transport.close(); server.close(); });
     await server.connect(transport);
@@ -162,7 +183,7 @@ app.post("/mcp/:store", async (req, res) => {
 const pending = new Map(); // state -> { key, exp }
 app.get("/auth/start", (req, res) => {
   const key = String(req.query.store || ""); const store = stores[key];
-  if (!store || !safeEq(String(req.query.key || ""), store.secret)) return res.status(401).send("Unauthorized");
+  if (!store || !accessLevel(store, String(req.query.key || ""))) return res.status(401).send("Unauthorized");
   const cid = store.clientId || CLIENT_ID;
   if (!cid || !(store.clientSecret || CLIENT_SECRET) || !process.env.PUBLIC_URL) return res.status(500).send("Server needs SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET and PUBLIC_URL.");
   const state = crypto.randomBytes(16).toString("hex");
