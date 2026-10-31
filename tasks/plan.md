@@ -34,7 +34,7 @@ T8 docs + two-app ops guide (needs T2-T6 final behaviour)
 ## Task list
 
 ### Phase 1: Foundation and highest-risk fix
-- [ ] T1: Test harness and `lib/guards.js` extraction (no behaviour change)
+- [x] T1: Test harness and `lib/guards.js` extraction (no behaviour change)
 - [ ] T2: Replace mutation blocklist with parsed allowlist
 
 ### Checkpoint: Guards

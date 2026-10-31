@@ -2,7 +2,7 @@
 
 ## Phase 1: Foundation and highest-risk fix
 
-### T1: Test harness and `lib/guards.js` extraction
+### T1 [DONE]: Test harness and `lib/guards.js` extraction
 **Description:** Add `node:test` and move `opType`, `accessLevel`, `safeEq` and the mutation check into `lib/guards.js` with no behaviour change, so later tasks are test-driven.
 - [ ] `npm test` runs `node --test` and passes
 - [ ] Tests cover: read key vs write key vs wrong key, equal-secret rejection, `opType` for query/mutation/anonymous/comment-prefixed documents
