@@ -18,6 +18,7 @@ import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { safeEq, accessLevel, opType, hasMutation, BLOCKED_MUTATIONS } from "./lib/guards.js";
 
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-10";
 
@@ -42,31 +43,6 @@ function loadStores() {
   return stores;
 }
 const stores = loadStores();
-
-// Returns "write" | "read" | null for the presented key. Write is checked first so a legacy
-// single key that is both read and write resolves to write.
-function accessLevel(store, presented) {
-  if (store.writeSecret && safeEq(presented, store.writeSecret)) return "write";
-  if (store.readSecret && safeEq(presented, store.readSecret)) return "read";
-  return null;
-}
-
-const safeEq = (a, b) => {
-  const x = crypto.createHash("sha256").update(a).digest();
-  const y = crypto.createHash("sha256").update(b).digest();
-  return crypto.timingSafeEqual(x, y);
-};
-
-// Returns "query" | "mutation" | "subscription" | null for the first operation keyword.
-function opType(doc) {
-  const stripped = doc.replace(/#[^\n]*/g, "").replace(/"""[\s\S]*?"""/g, "").trim();
-  if (stripped.startsWith("{")) return "query";
-  const m = stripped.match(/^(query|mutation|subscription)\b/);
-  return m ? m[1] : null;
-}
-// Mutation fields refused even with a write key (whole-word, case-sensitive match on the document).
-const BLOCKED_MUTATIONS = /\b(themePublish|themeDelete|appUninstall|appRevokeAccessScopes|refundCreate|orderCancel|orderCapture|giftCardCreate|giftCardUpdate|staffMemberDelete|shopLocaleDisable)\b/;
-const hasMutation = (doc) => /(^|[\s}])mutation\b/.test(doc.replace(/#[^\n]*/g, ""));
 
 const DATA_DIR = process.env.DATA_DIR || "/data";
 const TOKEN_FILE = path.join(DATA_DIR, "tokens.json");
