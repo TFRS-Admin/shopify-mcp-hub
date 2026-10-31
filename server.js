@@ -64,6 +64,8 @@ function opType(doc) {
   const m = stripped.match(/^(query|mutation|subscription)\b/);
   return m ? m[1] : null;
 }
+// Mutation fields refused even with a write key (whole-word, case-sensitive match on the document).
+const BLOCKED_MUTATIONS = /\b(themePublish|themeDelete|appUninstall|appRevokeAccessScopes|refundCreate|orderCancel|orderCapture|giftCardCreate|giftCardUpdate|staffMemberDelete|shopLocaleDisable)\b/;
 const hasMutation = (doc) => /(^|[\s}])mutation\b/.test(doc.replace(/#[^\n]*/g, ""));
 
 const DATA_DIR = process.env.DATA_DIR || "/data";
@@ -143,6 +145,9 @@ function buildServer(key, store, level) {
       async ({ query, variables }) => {
         if (opType(query) !== "mutation")
           return { isError: true, content: [{ type: "text", text: "This tool only accepts a mutation." }] };
+        const blocked = query.match(BLOCKED_MUTATIONS);
+        if (blocked)
+          return { isError: true, content: [{ type: "text", text: `Blocked: '${blocked[1]}' is not allowed through this hub. Do this action in the Shopify admin instead.` }] };
         return shopifyGraphql(store, key, query, variables);
       });
   }
@@ -157,7 +162,8 @@ app.post("/mcp/:store", async (req, res) => {
   const key = req.params.store;
   const store = stores[key];
   const auth = req.get("authorization") || "";
-  const level = store && auth.startsWith("Bearer ") ? accessLevel(store, auth.slice(7)) : null;
+  const presented = auth.startsWith("Bearer ") ? auth.slice(7) : (typeof req.query.key === "string" ? req.query.key : "");
+  const level = store && presented ? accessLevel(store, presented) : null;
   if (!level) {
     return res.status(401).json({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
   }
